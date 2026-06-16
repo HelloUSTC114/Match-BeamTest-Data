@@ -6,14 +6,31 @@ Step 2: 时钟标定 (DRS4 → FPGA tick域)
 Step 3: Digi ↔ FPGA 匹配 (全局Δt直方图+逐事件)
 Step 4: 示波器 Sequence展开 + Scope ↔ FPGA (spill count RMS)
 Step 5: 三系统完整事件表
+
+用法:
+  python run_pipeline.py --src D:/Codes/Analyze/data/BT_20260610_094205-run_0018
+                         --out data/BT_20260610_094205-run_0018/temp
 """
 
-import sys, os, numpy as np, re, glob, warnings, csv, gc
+import sys, os, argparse, numpy as np, re, glob, warnings, csv, gc
 from pathlib import Path
 from datetime import datetime
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 warnings.filterwarnings('ignore')
+
+# ── 参数解析 ──
+parser = argparse.ArgumentParser(description='三系统匹配流水线 (Digi ↔ FPGA ↔ Scope)')
+parser.add_argument('--src', required=True,
+                    help='原始数据目录 (含 digitizer/fpga/lecroy_wfm 子目录)')
+parser.add_argument('--out', default=None,
+                    help='输出目录 (默认: 当前仓库 data/<run名>/temp)')
+parser.add_argument('--scope-ch', default='C4',
+                    help='用于匹配的示波器通道 (默认: C4)')
+args = parser.parse_args()
+
+SRC_DATA = args.src
+SCOPE_CH = args.scope_ch
 
 # ── 仓库根目录 (Match-BeamTest-Data) ──
 REPO = Path(__file__).resolve().parent.parent.parent
@@ -28,11 +45,18 @@ awm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(awm)
 parse_trc = awm.parse_trc_binary
 
-# ── 配置: 修改 RUN 指向你的数据目录 ──
-RUN = str(REPO.parent / 'Analyze' / 'data' / 'BT_20260610_094205-run_0018')
-TEMP = os.path.join(RUN, 'temp')
-OUT = str(REPO / 'plots')
-os.makedirs(TEMP, exist_ok=True); os.makedirs(OUT, exist_ok=True)
+# ── 输出目录: 默认取 run 名放到仓库 data/ 下 ──
+if args.out:
+    TEMP = args.out
+else:
+    run_name = Path(SRC_DATA).name  # e.g. "BT_20260610_094205-run_0018"
+    TEMP = str(REPO / 'data' / run_name / 'temp')
+OUT = TEMP
+os.makedirs(TEMP, exist_ok=True)
+print(f"  数据源: {SRC_DATA}")
+print(f"  输出:   {OUT}")
+print(f"  示波器通道: {SCOPE_CH}")
+
 DIGI_NS = 8.5; FPGA_1HZ = 200_000_020
 
 def savefig(fig, name):
@@ -41,7 +65,7 @@ def savefig(fig, name):
 
 # ═══ Step 1: 分离1Hz ═══
 print("=" * 60); print("Step 1: 分离 1Hz vs TR"); print("=" * 60)
-digi = load_binary_events(os.path.join(RUN, 'digitizer', 'V1742_events.bin'))
+digi = load_binary_events(os.path.join(SRC_DATA, 'digitizer', 'V1742_events.bin'))
 n_digi = len(digi)
 d_num = np.array([e['event_number'] for e in digi], dtype=np.int64)
 d_tt  = np.array([e['trigger_time_tag'] for e in digi], dtype=np.int64)
@@ -70,21 +94,49 @@ plt.tight_layout(); savefig(fig, 'step1_classify.png')
 # ═══ Step 2: 时钟标定 ═══
 print("\n" + "=" * 60); print("Step 2: 时钟标定"); print("=" * 60)
 hz_idx = np.where(is_hz)[0]; tt_1hz = d_tt[hz_idx]
-theory_ft = np.zeros(len(hz_idx)); cum = 0.0; NOM_1S = 1e9 / DIGI_NS
+NOM_1S = 1e9 / DIGI_NS
+
+# 跳过高偏离的首脉冲（采集可能始于 1Hz 周期中间）
+start_i = 0
+if len(hz_idx) >= 3:
+    first_dt = tt_1hz[1] - tt_1hz[0]
+    if abs(first_dt - NOM_1S) / NOM_1S > 0.02:
+        start_i = 1
+
+theory_ft = np.zeros(len(hz_idx)); cum = 0.0
 for i in range(len(hz_idx)):
-    n_s = 1 if i == 0 else max(1, round((tt_1hz[i] - tt_1hz[i - 1]) / NOM_1S))
+    if i < start_i:
+        theory_ft[i] = -FPGA_1HZ
+        continue
+    if i == start_i:
+        n_s = 1
+    else:
+        n_s = max(1, round((tt_1hz[i] - tt_1hz[i - 1]) / NOM_1S))
     cum += n_s * FPGA_1HZ; theory_ft[i] = cum
-dt_ft = np.diff(theory_ft); dt_cyc = np.diff(tt_1hz)
-f_pd = dt_ft.astype(float) / dt_cyc; f_pd[0] = np.mean(f_pd[1:])
+
+valid = theory_ft >= 0
+vt, vtt = theory_ft[valid], tt_1hz[valid]
+dt_ft = np.diff(vt); dt_cyc = np.diff(vtt)
+f_pd_raw = dt_ft.astype(float) / np.maximum(dt_cyc, 1)
+f_pd = np.zeros(len(hz_idx))
+f_pd[valid] = np.insert(f_pd_raw, 0, np.mean(f_pd_raw[:5]) if len(f_pd_raw) >= 5 else f_pd_raw[0])
 
 def conv(t):
     s = int(np.searchsorted(tt_1hz, t, side='right')) - 1
     s = max(0, min(len(tt_1hz) - 2, s))
-    return theory_ft[s] + (t - tt_1hz[s]) * f_pd[s]
+    if theory_ft[s] < 0 and s + 1 < len(theory_ft):
+        s = s + 1
+    if theory_ft[s] < 0:
+        s = np.argmax(theory_ft >= 0)
+    return theory_ft[s] + (float(t) - float(tt_1hz[s])) * f_pd[s]
 
 t_ft = np.array([conv(int(t)) for t in d_tt])
-err = np.max(np.abs((t_ft[hz_idx] - t_ft[hz_idx[0]]) - (theory_ft - theory_ft[0])))
-print(f"  1Hz max error: {err:.0f} ticks, avg f_pd={np.mean(f_pd):.6f}")
+if start_i > 0:
+    vh = hz_idx[start_i:]
+    err = np.max(np.abs((t_ft[vh] - t_ft[vh[0]]) - (theory_ft[start_i:] - theory_ft[start_i])))
+else:
+    err = np.max(np.abs((t_ft[hz_idx] - t_ft[hz_idx[0]]) - (theory_ft - theory_ft[0])))
+print(f"  1Hz max error: {err:.0f} ticks, avg f_pd={np.mean(f_pd[f_pd > 0]):.6f}")
 
 tr_idx = np.where(~is_hz)[0]
 np.savez_compressed(os.path.join(TEMP, 'corrected_timetags.npz'),
@@ -99,8 +151,8 @@ ax.grid(True, alpha=0.3)
 plt.tight_layout(); savefig(fig, 'step2_calibration.png')
 
 # ═══ Step 3: Digi ↔ FPGA ═══
-print("\n" + "=" * 60); print("Step 3: Digi ↔ FPGA"); print("=" * 60)
-fpga = load_fpga_events(os.path.join(RUN, 'fpga', 'fpga_events.bin'))
+print("\n" + "=" * 60); print("Step 3: Digi <-> FPGA"); print("=" * 60)
+fpga = load_fpga_events(os.path.join(SRC_DATA, 'fpga', 'fpga_events.bin'))
 f_id = np.array([e.trigger_id for e in fpga], dtype=np.int64)
 f_tick = np.array([e.t_fpga for e in fpga], dtype=np.int64)
 n_fpga = len(f_id)
@@ -159,8 +211,8 @@ arr = np.array(matched, dtype=[('digi_evnum', 'i4'), ('fpga_id', 'i4'), ('dt', '
 np.savez(os.path.join(TEMP, 'matched_pairs.npz'), pairs=arr, offset_fticks=offset, sigma_fticks=sigma)
 
 # ═══ Step 4: Scope ↔ FPGA ═══
-print("\n" + "=" * 60); print("Step 4: Scope ↔ FPGA"); print("=" * 60)
-ch_files = sorted(glob.glob(os.path.join(RUN, 'lecroy_wfm', 'C4--Trace--*.trc')))
+print("\n" + "=" * 60); print("Step 4: Scope <-> FPGA"); print("=" * 60)
+ch_files = sorted(glob.glob(os.path.join(SRC_DATA, 'lecroy_wfm', 'C4--Trace--*.trc')))
 scope_data = []
 for fp in ch_files:
     file_idx = int(re.search(r'--Trace--(\d+)\.trc', os.path.basename(fp)).group(1))

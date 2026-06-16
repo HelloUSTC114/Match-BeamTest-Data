@@ -7,3 +7,4 @@ plots/
 temp/
 *.npz
 *.csv
+data/

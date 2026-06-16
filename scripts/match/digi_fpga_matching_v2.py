@@ -59,19 +59,35 @@ def load_and_calibrate(run_dir):
     NOM_1S = 1e9 / 8.5
     hz_idx = np.where(is_hz)[0]
     tt_1hz = d_tt[hz_idx]
+
+    # 跳过高偏离的首脉冲（采集可能始于 1Hz 周期中间）
+    start_i = 0
+    if len(hz_idx) >= 3:
+        first_dt = tt_1hz[1] - tt_1hz[0]
+        if abs(first_dt - NOM_1S) / NOM_1S > 0.02:
+            start_i = 1
+
     theory_ft = np.zeros(len(hz_idx), dtype=np.float64)
     cum = 0.0
     for i in range(len(hz_idx)):
-        n_s = 1 if i == 0 else max(
-            1, round((tt_1hz[i] - tt_1hz[i-1]) / NOM_1S))
+        if i < start_i:
+            theory_ft[i] = -FPGA_TICKS_PER_1HZ
+            continue
+        if i == start_i:
+            n_s = 1
+        else:
+            n_s = max(1, round((tt_1hz[i] - tt_1hz[i-1]) / NOM_1S))
         cum += n_s * FPGA_TICKS_PER_1HZ
         theory_ft[i] = cum
 
     # ── Step 3: 分段线性映射 DRS4 → FPGA tick ──
-    dt_ft = np.diff(theory_ft)
-    dt_cyc = np.diff(tt_1hz)
-    f_pd = dt_ft.astype(float) / dt_cyc
-    f_pd[0] = np.mean(f_pd[1:])
+    valid = theory_ft >= 0
+    vt, vtt = theory_ft[valid], tt_1hz[valid]
+    dt_ft = np.diff(vt)
+    dt_cyc = np.diff(vtt)
+    f_pd_raw = dt_ft.astype(float) / np.maximum(dt_cyc, 1)
+    f_pd = np.zeros(len(hz_idx))
+    f_pd[valid] = np.insert(f_pd_raw, 0, np.mean(f_pd_raw[:5]) if len(f_pd_raw) >= 5 else f_pd_raw[0])
 
     def conv(t):
         s = int(np.searchsorted(tt_1hz, t, side='right') - 1)
@@ -79,6 +95,10 @@ def load_and_calibrate(run_dir):
             s = 0
         if s >= len(tt_1hz) - 1:
             s = len(tt_1hz) - 2
+        if theory_ft[s] < 0 and s + 1 < len(theory_ft):
+            s = s + 1
+        if theory_ft[s] < 0:
+            s = np.argmax(theory_ft >= 0)
         return theory_ft[s] + (t - tt_1hz[s]) * f_pd[s]
 
     t_ft = np.array([conv(int(t)) for t in d_tt])

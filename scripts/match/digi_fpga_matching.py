@@ -86,10 +86,20 @@ def step1_separate_1hz(digi, d_num, d_tt, run_dir):
     NOM_1S = 1e9 / 8.5  # 理论每秒 DRS4 cycles
     tt_1hz = d_tt[hz_idx]
 
+    # 跳过高偏离的首脉冲（采集可能始于 1Hz 周期中间）
+    start_i = 0
+    if len(hz_idx) >= 3:
+        first_dt = tt_1hz[1] - tt_1hz[0]
+        if abs(first_dt - NOM_1S) / NOM_1S > 0.02:
+            start_i = 1
+
     theory_ft = np.zeros(len(hz_idx), dtype=np.float64)
     cum = 0.0
     for i in range(len(hz_idx)):
-        if i == 0:
+        if i < start_i:
+            theory_ft[i] = -N
+            continue
+        if i == start_i:
             n_s = 1
         else:
             n_s = max(1, round((tt_1hz[i] - tt_1hz[i-1]) / NOM_1S))
@@ -124,11 +134,14 @@ def step2_calibrate(run_dir):
     if len(tt_1hz) < 2:
         raise ValueError(f"Need >= 2 1Hz events, found {len(tt_1hz)}")
 
-    # 每段映射因子: f_pd = Δtheory_ft / ΔTT
-    dt_ft = np.diff(theory_ft)
-    dt_cyc = np.diff(tt_1hz)
-    f_pd = dt_ft.astype(float) / dt_cyc  # FPGA ticks per DRS4 cycle
-    f_pd[0] = np.mean(f_pd[1:])  # 首个用均值
+    # 每段映射因子: f_pd = Δtheory_ft / ΔTT (仅用有效段)
+    valid = theory_ft >= 0
+    vt, vtt = theory_ft[valid], tt_1hz[valid]
+    dt_ft = np.diff(vt)
+    dt_cyc = np.diff(vtt)
+    f_pd_raw = dt_ft.astype(float) / np.maximum(dt_cyc, 1)
+    f_pd = np.zeros(len(hz_idx))
+    f_pd[valid] = np.insert(f_pd_raw, 0, np.mean(f_pd_raw[:5]) if len(f_pd_raw) >= 5 else f_pd_raw[0])
 
     # 逐段线性映射
     def conv(t):
@@ -137,15 +150,23 @@ def step2_calibrate(run_dir):
             s = 0
         if s >= len(tt_1hz) - 1:
             s = len(tt_1hz) - 2
+        if theory_ft[s] < 0 and s + 1 < len(theory_ft):
+            s = s + 1
+        if theory_ft[s] < 0:
+            s = np.argmax(theory_ft >= 0)
         return theory_ft[s] + (t - tt_1hz[s]) * f_pd[s]
 
     t_ft = np.array([conv(int(t)) for t in tt_tags])
 
     # 验证 1Hz 映射精度
     t_1hz_ft = t_ft[hz_idx]
-    err = (t_1hz_ft - t_1hz_ft[0]) - (theory_ft - theory_ft[0])
+    if theory_ft[0] < 0:
+        start = np.argmax(theory_ft >= 0)
+        err = (t_1hz_ft[start:] - t_1hz_ft[start]) - (theory_ft[start:] - theory_ft[start])
+    else:
+        err = (t_1hz_ft - t_1hz_ft[0]) - (theory_ft - theory_ft[0])
     print(f"  1Hz max error: {np.max(np.abs(err)):.0f} ticks")
-    print(f"  平均 f_pd: {np.mean(f_pd):.6f} FPGA ticks / DRS4 cycle")
+    print(f"  平均 f_pd: {np.mean(f_pd[f_pd > 0]):.6f} FPGA ticks / DRS4 cycle")
 
     # 保存
     tr_idx = np.where(~is_hz)[0]
